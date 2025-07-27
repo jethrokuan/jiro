@@ -85,26 +85,47 @@ Common values: \":git\", \":builtin\", or external tools like \"difftastic\"."
   (ansi-color-filter-apply string))
 
 (defun jiro--parse-diff-output (diff-output)
-  "Parse DIFF-OUTPUT and return a list of file diffs."
+  "Parse DIFF-OUTPUT and return a list of file diffs with multiple chunks per file."
   (if (string-empty-p (string-trim diff-output))
-      '(("No changes" "No differences found in the current change."))
-    (let ((files '())
+      '(("No changes" (("No differences found in the current change." ""))))
+    (let ((file-groups (make-hash-table :test 'equal))
           (current-file nil)
           (current-diff '())
+          (chunk-counter (make-hash-table :test 'equal))
           (lines (split-string diff-output "\n")))
       (dolist (line lines)
         (cond
          ;; jj diff format: "path/to/file.ext --- FORMAT"
          ((string-match "^\\([^[:space:]]+\\) --- " line)
           (when current-file
-            (push (list current-file (string-join (reverse current-diff) "\n")) files))
+            ;; Add chunk to existing file group or create new one
+            (let ((existing-chunks (gethash current-file file-groups))
+                  (chunk-num (1+ (gethash current-file chunk-counter 0))))
+              (puthash current-file chunk-num chunk-counter)
+              (let ((chunk-title (format "Chunk %d" chunk-num))
+                    (chunk-content (string-join (reverse current-diff) "\n")))
+                (if existing-chunks
+                    (puthash current-file 
+                             (append existing-chunks (list (list chunk-title chunk-content)))
+                             file-groups)
+                  (puthash current-file (list (list chunk-title chunk-content)) file-groups)))))
           ;; Strip ANSI codes from file name for clean section titles
           (setq current-file (jiro--strip-ansi-codes (match-string 1 line)))
           (setq current-diff (list line)))
          ;; Standard git diff format (fallback)
          ((string-match "^diff --git a/\\(.*\\) b/\\(.*\\)$" line)
           (when current-file
-            (push (list current-file (string-join (reverse current-diff) "\n")) files))
+            ;; Add chunk to existing file group or create new one
+            (let ((existing-chunks (gethash current-file file-groups))
+                  (chunk-num (1+ (gethash current-file chunk-counter 0))))
+              (puthash current-file chunk-num chunk-counter)
+              (let ((chunk-title (format "Chunk %d" chunk-num))
+                    (chunk-content (string-join (reverse current-diff) "\n")))
+                (if existing-chunks
+                    (puthash current-file 
+                             (append existing-chunks (list (list chunk-title chunk-content)))
+                             file-groups)
+                  (puthash current-file (list (list chunk-title chunk-content)) file-groups)))))
           (setq current-file (match-string 1 line))
           (setq current-diff (list line)))
          ;; Accumulate all lines for current file
@@ -117,11 +138,24 @@ Common values: \":git\", \":builtin\", or external tools like \"difftastic\"."
               (setq current-diff (list line)))))))
       ;; Handle the last file
       (when current-file
-        (push (list current-file (string-join (reverse current-diff) "\n")) files))
-      ;; Return parsed files or fallback to raw output
-      (if files
-          (reverse files)
-        (list (list "Raw Diff Output" diff-output))))))
+        (let ((existing-chunks (gethash current-file file-groups))
+              (chunk-num (1+ (gethash current-file chunk-counter 0))))
+          (let ((chunk-title (format "Chunk %d" chunk-num))
+                (chunk-content (string-join (reverse current-diff) "\n")))
+            (if existing-chunks
+                (puthash current-file 
+                         (append existing-chunks (list (list chunk-title chunk-content)))
+                         file-groups)
+              (puthash current-file (list (list chunk-title chunk-content)) file-groups)))))
+      ;; Convert hash table to list
+      (let ((files '()))
+        (maphash (lambda (file-name chunks)
+                   (push (list file-name chunks) files))
+                 file-groups)
+        ;; Return parsed files or fallback to raw output
+        (if files
+            (nreverse files)
+          (list (list "Raw Diff Output" (list (list "Content" diff-output)))))))))
 
 
 (defun jiro--insert-status-info (status-info)
@@ -131,22 +165,29 @@ Common values: \":git\", \":builtin\", or external tools like \"difftastic\"."
     ;; Process ANSI color codes in status info
     (ansi-color-apply-on-region start (point))))
 
-(defun jiro--insert-file-diff (file-name diff-content)
-  "Insert a file diff section for FILE-NAME with DIFF-CONTENT."
+(defun jiro--insert-file-diff (file-name chunks)
+  "Insert a file diff section for FILE-NAME with multiple CHUNKS."
   (magit-insert-section (file file-name t)
     (magit-insert-heading file-name)
-    (let ((start (point))
-          (lines (split-string diff-content "\n"))
-          (filtered-lines '()))
-      ;; Skip the first line if it's similar to the section title
-      (dolist (line (if (and lines (string-match-p (regexp-quote file-name) (car lines)))
-                        (cdr lines)
-                      lines))
-        (push line filtered-lines))
-      (when filtered-lines
-        (insert (string-join (reverse filtered-lines) "\n") "\n\n")
-        ;; Process ANSI color codes
-        (ansi-color-apply-on-region start (point))))))
+    (magit-insert-section-body
+      (dolist (chunk chunks)
+        (let ((chunk-title (car chunk))
+              (chunk-content (cadr chunk)))
+          (magit-insert-section (hunk chunk-title t)
+            (magit-insert-heading chunk-title)
+            (let ((start (point))
+                  (lines (split-string chunk-content "\n"))
+                  (filtered-lines '()))
+              ;; Skip the first line if it's similar to the section title
+              (dolist (line (if (and lines (string-match-p (regexp-quote file-name) (car lines)))
+                                (cdr lines)
+                              lines))
+                (push line filtered-lines))
+              (when filtered-lines
+                (insert (string-join (reverse filtered-lines) "\n") "\n")
+                ;; Process ANSI color codes
+                (ansi-color-apply-on-region start (point))))))
+        (insert ?\n)))))
 
 (defun jiro--refresh-buffer ()
   "Refresh the current jiro buffer content."
@@ -155,7 +196,7 @@ Common values: \":git\", \":builtin\", or external tools like \"difftastic\"."
          (file-diffs (jiro--parse-diff-output diff-output)))
     (let ((inhibit-read-only t))
       (erase-buffer)
-      (magit-insert-section (jiro-root)
+      (magit-insert-section (status)
         (jiro--insert-status-info status-info)
         (dolist (file-diff file-diffs)
           (jiro--insert-file-diff (car file-diff) (cadr file-diff))))
